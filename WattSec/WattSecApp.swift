@@ -10,6 +10,7 @@ import Combine
 import Foundation
 import ServiceManagement
 import SwiftUI
+import UserNotifications
 
 // MARK: - Main App
 
@@ -74,6 +75,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var widestWidths: [DetailLevel: [Int: CGFloat]] = [:]
     private var highWattageTimestamp: Date?
     private var highWattageTimer: Timer?
+
+    // High Power Alert
+    var consecutiveHighCount = 0
+    private var hasAlertedDuringCurrentHigh = false
+    var alertThreshold: Double {
+        get { UserDefaults.standard.double(forKey: "alertThreshold") }
+        set { UserDefaults.standard.set(newValue, forKey: "alertThreshold") }
+    }
+
+    // Energy Session Tracker
+    var sessionEnergyWh: Double = 0.0
+    var lastTickTime: Date = Date()
+    var sessionStartTime: Date = Date()
+
+    // Cached dynamic menu item for session display
+    private var sessionMenuItem: NSMenuItem?
     
     // MARK: Application Lifecycle
     
@@ -84,6 +101,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         bindToPowerMonitor()
         PowerMonitor.shared.fetchWattage()
         checkLaunchAtLoginStatus()
+        
+        // Request notification permission for high power alerts
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
     
     deinit {
@@ -165,6 +185,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let menu = NSMenu()
+        
+        // Session energy line and reset action (no cost display)
+        let initialSessionLine = String(format: "Session: %.2f Wh", sessionEnergyWh)
+        let sessionItem = NSMenuItem(title: initialSessionLine, action: nil, keyEquivalent: "")
+        self.sessionMenuItem = sessionItem
+        menu.addItem(sessionItem)
+
+        let resetItem = NSMenuItem(title: "↺  Reset Session", action: #selector(resetSession), keyEquivalent: "r")
+        resetItem.target = self
+        menu.addItem(resetItem)
+
+        let reportItem = NSMenuItem(title: "Session Report…", action: #selector(showSessionReport), keyEquivalent: "")
+        reportItem.target = self
+        menu.addItem(reportItem)
+        menu.addItem(NSMenuItem.separator())
+
+        // Alert Threshold submenu
+        menu.addItem(createAlertThresholdMenuItem())
+        menu.addItem(NSMenuItem.separator())
+        
         menu.addItem(createDetailMenuItem())
         menu.addItem(createPaceMenuItem())
         menu.addItem(createWidthModeItem())
@@ -244,6 +284,116 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return menuItem
     }
     
+    // MARK: Alerts & Session Menu Builders
+
+    private func createAlertThresholdMenuItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Alert Threshold", action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        let options: [(String, Double)] = [
+            ("Disabled", 0), ("30W", 30), ("40W", 40),
+            ("50W", 50), ("60W", 60), ("80W", 80), ("100W", 100)
+        ]
+        for (label, value) in options {
+            let item = NSMenuItem(title: label, action: #selector(setThreshold(_:)), keyEquivalent: "")
+            item.representedObject = value
+            item.target = self
+            item.state = alertThreshold == value ? .on : .off
+            submenu.addItem(item)
+        }
+        parent.submenu = submenu
+        return parent
+    }
+
+    // MARK: Alerts & Session Logic
+
+    private func updateSessionMenuItem() {
+        let line = String(format: "Session: %.2f Wh", sessionEnergyWh)
+        sessionMenuItem?.title = line
+    }
+
+    private func handleWattageUpdate(watts: Double) {
+        // Energy accumulation with 60s cap to avoid sleep spikes
+        let now = Date()
+        let deltaSeconds = min(now.timeIntervalSince(lastTickTime), 60)
+        let deltaHours = deltaSeconds / 3600.0
+        sessionEnergyWh += watts * deltaHours
+        lastTickTime = now
+
+        // High power alert detection (5 consecutive ticks)
+        let threshold = alertThreshold
+        if threshold > 0 && watts > threshold {
+            if !hasAlertedDuringCurrentHigh {
+                consecutiveHighCount += 1
+                if consecutiveHighCount == 5 {
+                    sendHighPowerNotification(watts: watts)
+                    consecutiveHighCount = 0
+                    hasAlertedDuringCurrentHigh = true
+                }
+            }
+        } else {
+            if consecutiveHighCount > 0 { consecutiveHighCount = 0 }
+            hasAlertedDuringCurrentHigh = false
+        }
+
+        // Update dynamic UI
+        updateSessionMenuItem()
+        updateWattageDisplay()
+    }
+
+    private func sendHighPowerNotification(watts: Double) {
+        let content = UNMutableNotificationContent()
+        content.title = "⚡ High Power Draw"
+        content.body = "Your Mac is using \(String(format: "%.1f", watts))W"
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "highPower-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    @objc private func resetSession() {
+        sessionEnergyWh = 0.0
+        lastTickTime = Date()
+        sessionStartTime = Date()
+        updateSessionMenuItem()
+    }
+    
+    @objc private func showSessionReport() {
+        let now = Date()
+        let elapsedSeconds = now.timeIntervalSince(sessionStartTime)
+        let elapsedHours = max(elapsedSeconds / 3600.0, 0.000001)
+        let averageWatts = sessionEnergyWh / elapsedHours
+
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.hour, .minute, .second]
+        formatter.unitsStyle = .abbreviated
+        let durationString = formatter.string(from: elapsedSeconds) ?? String(format: "%.0fs", elapsedSeconds)
+
+        let message = "Total Energy: " + String(format: "%.2f Wh\n", sessionEnergyWh) +
+                      "Duration: \(durationString)\n" +
+                      "Average Power: " + String(format: "%.1f W", averageWatts)
+
+        let alert = NSAlert()
+        alert.messageText = "Session Report"
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
+
+    @objc private func setThreshold(_ sender: NSMenuItem) {
+        alertThreshold = sender.representedObject as? Double ?? 0
+        consecutiveHighCount = 0
+        hasAlertedDuringCurrentHigh = false
+        // Update checkmarks
+        if let menu = statusItem?.menu,
+           let parent = menu.items.first(where: { $0.title == "Alert Threshold" }) {
+            parent.submenu?.items.forEach { $0.state = ($0.representedObject as? Double == alertThreshold) ? .on : .off }
+        }
+    }
+
     // MARK: Menu Actions
     
     @objc private func changeDetailLevel(sender: NSMenuItem) {
@@ -431,14 +581,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wattageSubscription = PowerMonitor.shared.$wattage
             .debounce(for: .seconds(0.1), scheduler: DispatchQueue.main)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.updateWattageDisplay()
+            .sink { [weak self] watts in
+                self?.handleWattageUpdate(watts: watts)
             }
     }
     
     // MARK: Menu Actions
     
     @objc private func showMenu() {
+        updateSessionMenuItem()
         statusItem?.button?.performClick(nil)
     }
     
@@ -544,3 +695,4 @@ class PowerMonitor: ObservableObject {
             }
     }
 }
+
