@@ -15,8 +15,8 @@ Display macOS power usage (wattage) in the menu bar
 WattWatch can be installed with Homebrew:
 
 ```
-brew tap beutton/brew
-brew install wattsec
+brew tap Shivansh722/brew
+brew install --cask wattwatch
 ```
 
 ## Compile
