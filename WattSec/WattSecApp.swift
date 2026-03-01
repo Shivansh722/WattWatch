@@ -11,6 +11,7 @@ import Foundation
 import ServiceManagement
 import SwiftUI
 import UserNotifications
+import IOKit.ps
 
 // MARK: - Main App
 
@@ -91,6 +92,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // Cached dynamic menu item for session display
     private var sessionMenuItem: NSMenuItem?
+
+    // Charger Intelligence
+    private var pluggedAtFullStart: Date?
+    private var overchargeNotified = false
+    private var sweetSpotNotified = false
+    private var chargeNowNotified = false
+
+    // Daily Power Digest
+    private var dailyStartOfDay: Date = Calendar.current.startOfDay(for: Date())
+    private var dailyEnergyWh: Double = 0.0
+    private var hourlyEnergyWh: [Int: Double] = [:]
+    private var dailyPeakW: Double = 0.0
+    private var dailyPeakTime: Date?
+    private var dailyDigestTimer: Timer?
     
     // MARK: Application Lifecycle
     
@@ -104,12 +119,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Request notification permission for high power alerts
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        
+        // Schedule daily power digest at next 6pm
+        scheduleNextDailyDigest()
     }
     
     deinit {
         // Cancel subscription to prevent memory leaks
         wattageSubscription?.cancel()
         highWattageTimer?.invalidate()
+        dailyDigestTimer?.invalidate()
     }
     
     // MARK: User Preferences
@@ -199,6 +218,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let reportItem = NSMenuItem(title: "Session Report…", action: #selector(showSessionReport), keyEquivalent: "")
         reportItem.target = self
         menu.addItem(reportItem)
+
+        let digestNowItem = NSMenuItem(title: "Send Daily Digest Now", action: #selector(sendDailyDigestNow), keyEquivalent: "")
+        digestNowItem.target = self
+        menu.addItem(digestNowItem)
+
+        let openLogsItem = NSMenuItem(title: "Open Logs…", action: #selector(openLogs), keyEquivalent: "")
+        openLogsItem.target = self
+        menu.addItem(openLogsItem)
         menu.addItem(NSMenuItem.separator())
 
         // Alert Threshold submenu
@@ -319,6 +346,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         sessionEnergyWh += watts * deltaHours
         lastTickTime = now
 
+        // Daily accumulation and peak tracking
+        // Reset daily counters if day changed
+        let startOfToday = Calendar.current.startOfDay(for: now)
+        if startOfToday != dailyStartOfDay {
+            dailyStartOfDay = startOfToday
+            dailyEnergyWh = 0.0
+            hourlyEnergyWh.removeAll()
+            dailyPeakW = 0.0
+            dailyPeakTime = nil
+        }
+        dailyEnergyWh += watts * deltaHours
+        let hour = Calendar.current.component(.hour, from: now)
+        hourlyEnergyWh[hour] = (hourlyEnergyWh[hour] ?? 0.0) + watts * deltaHours
+        if watts > dailyPeakW {
+            dailyPeakW = watts
+            dailyPeakTime = now
+        }
+
+        // Charger Intelligence evaluation
+        evaluateChargerIntelligence(currentWatts: watts)
+
         // High power alert detection (5 consecutive ticks)
         let threshold = alertThreshold
         if threshold > 0 && watts > threshold {
@@ -392,6 +440,165 @@ class AppDelegate: NSObject, NSApplicationDelegate {
            let parent = menu.items.first(where: { $0.title == "Alert Threshold" }) {
             parent.submenu?.items.forEach { $0.state = ($0.representedObject as? Double == alertThreshold) ? .on : .off }
         }
+    }
+
+    // MARK: Battery & Digest Helpers
+
+    private func fetchBatteryInfo() -> (percent: Int, isOnAC: Bool, isCharging: Bool)? {
+        let snapshot = IOPSCopyPowerSourcesInfo().takeRetainedValue()
+        let sources = IOPSCopyPowerSourcesList(snapshot).takeRetainedValue() as Array
+        for ps in sources {
+            let desc = IOPSGetPowerSourceDescription(snapshot, ps).takeUnretainedValue() as NSDictionary
+            if let type = desc[kIOPSTypeKey] as? String, type == kIOPSInternalBatteryType as String {
+                let current = desc[kIOPSCurrentCapacityKey] as? Int ?? 0
+                let max = desc[kIOPSMaxCapacityKey] as? Int ?? 100
+                let percent = max > 0 ? Int((Double(current) / Double(max)) * 100.0) : 0
+                let powerSource = desc[kIOPSPowerSourceStateKey] as? String ?? (kIOPSBatteryPowerValue as String)
+                let isOnAC = powerSource == (kIOPSACPowerValue as String)
+                let isCharging = (desc[kIOPSIsChargingKey] as? Bool) ?? false
+                return (percent, isOnAC, isCharging)
+            }
+        }
+        return nil
+    }
+
+    private func evaluateChargerIntelligence(currentWatts: Double) {
+        guard let info = fetchBatteryInfo() else { return }
+        let now = Date()
+
+        // Overcharging: at 100% on AC for 2 hours
+        if info.isOnAC && info.percent >= 100 {
+            if pluggedAtFullStart == nil {
+                pluggedAtFullStart = now
+                overchargeNotified = false
+            } else if !overchargeNotified, let start = pluggedAtFullStart, now.timeIntervalSince(start) >= 2 * 3600 {
+                sendNotification(title: "🔌 Overcharging", body: "Battery at 100% for 2 hours while plugged in.")
+                overchargeNotified = true
+            }
+        } else {
+            pluggedAtFullStart = nil
+            overchargeNotified = false
+        }
+
+        // Sweet spot: notify at 80% while charging on AC
+        if info.isOnAC && info.isCharging && info.percent >= 80 {
+            if !sweetSpotNotified {
+                sendNotification(title: "🔋 Sweet Spot", body: "Battery reached 80%. You can unplug to preserve battery health.")
+                sweetSpotNotified = true
+            }
+        } else if !info.isOnAC || info.percent < 75 {
+            // reset when unplugged or sufficiently below threshold for hysteresis
+            sweetSpotNotified = false
+        }
+
+        // Charge now: on battery, low percent, under high load
+        if !info.isOnAC && info.percent <= 20 && currentWatts >= 15 {
+            if !chargeNowNotified {
+                sendNotification(title: "⚠️ Charge Now", body: "Battery is low (\(info.percent)%) under high load. Consider plugging in.")
+                chargeNowNotified = true
+            }
+        } else if info.isOnAC || info.percent >= 25 || currentWatts < 10 {
+            chargeNowNotified = false
+        }
+    }
+
+    private func scheduleNextDailyDigest() {
+        dailyDigestTimer?.invalidate()
+        let calendar = Calendar.current
+        let now = Date()
+        var comps = calendar.dateComponents([.year, .month, .day], from: now)
+        comps.hour = 18
+        comps.minute = 0
+        comps.second = 0
+        let todaySix = calendar.date(from: comps)!
+        let fireDate = (now <= todaySix) ? todaySix : calendar.date(byAdding: .day, value: 1, to: todaySix)!
+        dailyDigestTimer = Timer(fireAt: fireDate, interval: 0, target: self, selector: #selector(dailyDigestTimerFired), userInfo: nil, repeats: false)
+        if let timer = dailyDigestTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    @objc private func dailyDigestTimerFired() {
+        fireDailyDigest()
+        scheduleNextDailyDigest()
+    }
+
+    private func fireDailyDigest() {
+        // Compose digest from today's data
+        let energy = dailyEnergyWh
+        let peakW = dailyPeakW
+        let peakTime = dailyPeakTime
+        let hourLabel: String
+        if let (hour, _) = hourlyEnergyWh.min(by: { $0.value < $1.value }) {
+            let df = DateFormatter()
+            df.dateFormat = "ha"
+            var comps = Calendar.current.dateComponents([.year, .month, .day], from: dailyStartOfDay)
+            comps.hour = hour
+            let hourDate = Calendar.current.date(from: comps) ?? Date()
+            hourLabel = df.string(from: hourDate).lowercased()
+        } else {
+            hourLabel = "N/A"
+        }
+        let timeFormatter = DateFormatter()
+        timeFormatter.timeStyle = .short
+        let peakTimeString = peakTime != nil ? timeFormatter.string(from: peakTime!) : "—"
+        let body = String(format: "Today: %.0f Wh used · Peak was %.0fW at %@ · Most efficient hour: %@", energy, peakW, peakTimeString, hourLabel)
+        sendNotification(title: "Daily Power Digest", body: body)
+        writeDailyLog(date: Date())
+    }
+
+    private var logsDirectoryURL: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = base.appendingPathComponent("WattWatch/daily_logs", isDirectory: true)
+        if !fm.fileExists(atPath: dir.path) {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    private func writeDailyLog(date: Date) {
+        struct DailyLog: Codable {
+            let date: String
+            let energyWh: Double
+            let peakW: Double
+            let peakTimeISO: String?
+            let hourlyWh: [Int: Double]
+        }
+        let iso = ISO8601DateFormatter()
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd"
+        let entry = DailyLog(
+            date: df.string(from: date),
+            energyWh: dailyEnergyWh,
+            peakW: dailyPeakW,
+            peakTimeISO: dailyPeakTime != nil ? iso.string(from: dailyPeakTime!) : nil,
+            hourlyWh: hourlyEnergyWh
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try? encoder.encode(entry)
+        if let data = data {
+            let fileURL = logsDirectoryURL.appendingPathComponent(df.string(from: date) + ".json")
+            try? data.write(to: fileURL)
+        }
+    }
+
+    private func sendNotification(title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
+    }
+
+    @objc private func sendDailyDigestNow() {
+        fireDailyDigest()
+    }
+
+    @objc private func openLogs() {
+        NSWorkspace.shared.open(logsDirectoryURL)
     }
 
     // MARK: Menu Actions
