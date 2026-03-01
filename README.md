@@ -2,7 +2,7 @@
 <img src="https://github.com/user-attachments/assets/ed040304-5689-4323-b9c0-c9355b9c4365" width="200"/>
 </p>
 
-# WattSec
+# WattWatch
 
 <p align="center">
 <img src="https://github.com/user-attachments/assets/1d444659-dbe0-48d1-9368-a79d10ccf8c5"/>
@@ -12,7 +12,7 @@ Display macOS power usage (wattage) in the menu bar
 
 ## Installation
 
-WattSec can be installed with Homebrew:
+WattWatch can be installed with Homebrew:
 
 ```
 brew tap beutton/brew
