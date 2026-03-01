@@ -19,8 +19,6 @@ brew tap beutton/brew
 brew install wattsec
 ```
 
-Alternatively, you can download the latest release [here](https://github.com/beutton/wattsec/releases/latest).
-
 ## Compile
 
 ```bash
@@ -33,13 +31,16 @@ open dist/WattSec.app
 ## Settings
 
 <p align="center">
-<img src="https://github.com/user-attachments/assets/9d213036-225c-4369-9b18-1cb6b94956e1"/>
+<img width="493" height="417" alt="image" src="https://github.com/user-attachments/assets/117ac43e-977a-4d7c-949f-18719ac2f4a8" />
+
 </p>
 
 - **Detail** - The number of watt decimal places to show (0, 1, or 2)
 - **Pace** - The refresh interval (1s, 3s, or 5s)
 - **Width** - The width of the metric in the menu bar (Dynamic or Fixed)
 - **Launch** - Toggle Launch at Login
+- **High Power Alerts** - Tells you when your energy consumption peaks
+- **Session tracking** - Get insights
 
 ## Credit
 
